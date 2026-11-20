@@ -1,7 +1,7 @@
 const express = require("express");
 const path = require("path");
 const compression = require("compression");
-const { ensureDirs, loadDB, UPLOADS_DIR } = require("./db");
+const { ensureDirs, UPLOADS_DIR, getStorageDriver } = require("./db");
 const { ADMIN_PASSWORD } = require("./auth");
 const apiRouter = require("./routes/api");
 
@@ -9,7 +9,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 ensureDirs();
-loadDB();
 
 app.use(compression());
 app.use(express.json({ limit: "15mb" }));
@@ -30,7 +29,8 @@ if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`\n  Sundeepa Bamval — Public Showcase:  http://localhost:${PORT}/#showcase`);
     console.log(`  Sundeepa Bamval — Admin Studio:     http://localhost:${PORT}/admin#showcase`);
-    console.log(`  Admin Password:                     ${ADMIN_PASSWORD}\n`);
+    console.log(`  Admin Password:                     ${ADMIN_PASSWORD}`);
+    console.log(`  Storage Driver:                     ${getStorageDriver()}\n`);
   });
 }
 
