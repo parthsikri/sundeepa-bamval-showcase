@@ -9,13 +9,20 @@ const DATA_DIR = path.join(BASE_LOCAL, "data");
 const UPLOADS_DIR = path.join(BASE_LOCAL, "uploads");
 const DB_FILE = path.join(DATA_DIR, "collection.json");
 
-const BLOB_STATE_PATH = "atelier-db/collection.json";
-const SUPABASE_TABLE = "atelier_state";
-const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "atelier-uploads";
+const STATE_KEY = "atelier-db/collection.json";
+
+function hasR2Config() {
+  return Boolean(
+    process.env.R2_ACCOUNT_ID &&
+      process.env.R2_ACCESS_KEY_ID &&
+      process.env.R2_SECRET_ACCESS_KEY &&
+      process.env.R2_BUCKET
+  );
+}
 
 function getDriver() {
+  if (hasR2Config()) return "cloudflare-r2";
   if (process.env.BLOB_READ_WRITE_TOKEN) return "vercel-blob";
-  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) return "supabase";
   return "local";
 }
 
@@ -34,7 +41,122 @@ function ensureLocalDirs() {
 }
 
 // ==========================================================================
-// Driver 1: Vercel Blob (Recommended — Never Pauses, 1-Click in Vercel)
+// Driver 1: Cloudflare R2 (10 GB Free, Unlimited Egress, Never Pauses)
+// ==========================================================================
+
+let r2Client = null;
+let s3Mod = null;
+
+function getR2() {
+  if (!s3Mod) s3Mod = require("@aws-sdk/client-s3");
+  if (!r2Client) {
+    const { S3Client } = s3Mod;
+    r2Client = new S3Client({
+      region: "auto",
+      endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+      },
+    });
+  }
+  return { client: r2Client, ...s3Mod };
+}
+
+function r2PublicBase() {
+  return String(process.env.R2_PUBLIC_URL || "").replace(/\/+$/, "");
+}
+
+async function r2ReadJSON() {
+  const { client, GetObjectCommand } = getR2();
+  try {
+    const res = await client.send(
+      new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET,
+        Key: STATE_KEY,
+      })
+    );
+    const text = await res.Body.transformToString("utf8");
+    return JSON.parse(text);
+  } catch (err) {
+    if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
+      return null;
+    }
+    throw new Error(`Cloudflare R2 read error: ${err.message}`);
+  }
+}
+
+async function r2WriteJSON(data) {
+  const { client, PutObjectCommand } = getR2();
+  await client.send(
+    new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET,
+      Key: STATE_KEY,
+      Body: JSON.stringify(data),
+      ContentType: "application/json; charset=utf-8",
+      CacheControl: "no-store",
+    })
+  );
+}
+
+async function r2UploadImage(buffer, originalname, mimetype) {
+  const { client, PutObjectCommand } = getR2();
+  const filename = makeFilename(originalname);
+  const key = `uploads/${filename}`;
+  await client.send(
+    new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET,
+      Key: key,
+      Body: buffer,
+      ContentType: mimetype || "image/jpeg",
+      CacheControl: "public, max-age=31536000, immutable",
+    })
+  );
+  const pubBase = r2PublicBase();
+  return pubBase ? `${pubBase}/${key}` : `/uploads/${filename}`;
+}
+
+async function r2ReadImage(filename) {
+  const { client, GetObjectCommand } = getR2();
+  const key = `uploads/${path.basename(filename)}`;
+  const res = await client.send(
+    new GetObjectCommand({
+      Bucket: process.env.R2_BUCKET,
+      Key: key,
+    })
+  );
+  const bytes = await res.Body.transformToByteArray();
+  return {
+    buffer: Buffer.from(bytes),
+    contentType: res.ContentType || "image/jpeg",
+  };
+}
+
+async function r2DeleteImage(url) {
+  if (!url) return;
+  let key = "";
+  const pubBase = r2PublicBase();
+  if (pubBase && url.startsWith(`${pubBase}/`)) {
+    key = url.slice(pubBase.length + 1);
+  } else if (url.startsWith("/uploads/")) {
+    key = `uploads/${path.basename(url)}`;
+  }
+  if (!key) return;
+  try {
+    const { client, DeleteObjectCommand } = getR2();
+    await client.send(
+      new DeleteObjectCommand({
+        Bucket: process.env.R2_BUCKET,
+        Key: key,
+      })
+    );
+  } catch (err) {
+    console.warn("Cloudflare R2 delete warning:", err.message);
+  }
+}
+
+// ==========================================================================
+// Driver 2: Vercel Blob (1 GB Free, 1-Click in Vercel Dashboard)
 // ==========================================================================
 
 let vercelBlobMod = null;
@@ -45,8 +167,8 @@ function getVercelBlob() {
 
 async function blobReadJSON() {
   const { list } = getVercelBlob();
-  const { blobs } = await list({ prefix: BLOB_STATE_PATH, limit: 1 });
-  const match = blobs.find((b) => b.pathname === BLOB_STATE_PATH) || blobs[0];
+  const { blobs } = await list({ prefix: STATE_KEY, limit: 1 });
+  const match = blobs.find((b) => b.pathname === STATE_KEY) || blobs[0];
   if (!match) return null;
   const res = await fetch(`${match.url}?t=${Date.now()}`, { cache: "no-store" });
   if (!res.ok) return null;
@@ -55,7 +177,7 @@ async function blobReadJSON() {
 
 async function blobWriteJSON(data) {
   const { put } = getVercelBlob();
-  await put(BLOB_STATE_PATH, JSON.stringify(data), {
+  await put(STATE_KEY, JSON.stringify(data), {
     access: "public",
     addRandomSuffix: false,
     allowOverwrite: true,
@@ -83,68 +205,6 @@ async function blobDeleteImage(url) {
     await del(url);
   } catch (err) {
     console.warn("Vercel Blob delete warning:", err.message);
-  }
-}
-
-// ==========================================================================
-// Driver 2: Supabase (Postgres + Storage Bucket)
-// ==========================================================================
-
-let supabaseClient = null;
-function getSupabase() {
-  if (!supabaseClient) {
-    const { createClient } = require("@supabase/supabase-js");
-    supabaseClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
-      auth: { persistSession: false, autoRefreshToken: false },
-    });
-  }
-  return supabaseClient;
-}
-
-async function supabaseReadJSON() {
-  const sb = getSupabase();
-  const { data, error } = await sb.from(SUPABASE_TABLE).select("data").eq("id", "main").maybeSingle();
-  if (error) throw new Error(`Supabase read error: ${error.message}`);
-  return data ? data.data : null;
-}
-
-async function supabaseWriteJSON(payload) {
-  const sb = getSupabase();
-  const { error } = await sb.from(SUPABASE_TABLE).upsert(
-    {
-      id: "main",
-      data: payload,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "id" }
-  );
-  if (error) throw new Error(`Supabase write error: ${error.message}`);
-}
-
-async function supabaseUploadImage(buffer, originalname, mimetype) {
-  const sb = getSupabase();
-  const filename = makeFilename(originalname);
-  const storagePath = `designs/${filename}`;
-  const { error } = await sb.storage.from(SUPABASE_BUCKET).upload(storagePath, buffer, {
-    contentType: mimetype || "image/jpeg",
-    upsert: false,
-  });
-  if (error) throw new Error(`Supabase image upload failed: ${error.message}`);
-  const { data } = sb.storage.from(SUPABASE_BUCKET).getPublicUrl(storagePath);
-  return data.publicUrl;
-}
-
-async function supabaseDeleteImage(url) {
-  if (!url || !url.includes(`/storage/v1/object/public/${SUPABASE_BUCKET}/`)) return;
-  try {
-    const sb = getSupabase();
-    const marker = `/storage/v1/object/public/${SUPABASE_BUCKET}/`;
-    const storagePath = decodeURIComponent(url.split(marker)[1] || "");
-    if (storagePath) {
-      await sb.storage.from(SUPABASE_BUCKET).remove([storagePath]);
-    }
-  } catch (err) {
-    console.warn("Supabase image delete warning:", err.message);
   }
 }
 
@@ -194,30 +254,30 @@ async function localDeleteImage(url) {
 
 async function readState() {
   const driver = getDriver();
+  if (driver === "cloudflare-r2") return r2ReadJSON();
   if (driver === "vercel-blob") return blobReadJSON();
-  if (driver === "supabase") return supabaseReadJSON();
   return localReadJSON();
 }
 
 async function writeState(data) {
   const driver = getDriver();
+  if (driver === "cloudflare-r2") return r2WriteJSON(data);
   if (driver === "vercel-blob") return blobWriteJSON(data);
-  if (driver === "supabase") return supabaseWriteJSON(data);
   return localWriteJSON(data);
 }
 
 async function saveImage(buffer, originalname, mimetype) {
   const driver = getDriver();
+  if (driver === "cloudflare-r2") return r2UploadImage(buffer, originalname, mimetype);
   if (driver === "vercel-blob") return blobUploadImage(buffer, originalname, mimetype);
-  if (driver === "supabase") return supabaseUploadImage(buffer, originalname, mimetype);
   return localUploadImage(buffer, originalname);
 }
 
 async function deleteImage(url) {
   if (!url) return;
   const driver = getDriver();
+  if (driver === "cloudflare-r2") return r2DeleteImage(url);
   if (driver === "vercel-blob") return blobDeleteImage(url);
-  if (driver === "supabase") return supabaseDeleteImage(url);
   return localDeleteImage(url);
 }
 
@@ -229,4 +289,5 @@ module.exports = {
   writeState,
   saveImage,
   deleteImage,
+  r2ReadImage,
 };
