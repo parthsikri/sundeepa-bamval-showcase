@@ -9,19 +9,20 @@ const DATA_DIR = path.join(BASE_LOCAL, "data");
 const UPLOADS_DIR = path.join(BASE_LOCAL, "uploads");
 const DB_FILE = path.join(DATA_DIR, "collection.json");
 
-const STATE_KEY = "atelier-db/collection.json";
+const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || "sundeepa-bamval";
+const CLOUDINARY_STATE_PUBLIC_ID = `${CLOUDINARY_FOLDER}/collection.json`;
+const BLOB_STATE_KEY = "atelier-db/collection.json";
 
-function hasR2Config() {
+function hasCloudinaryConfig() {
   return Boolean(
-    process.env.R2_ACCOUNT_ID &&
-      process.env.R2_ACCESS_KEY_ID &&
-      process.env.R2_SECRET_ACCESS_KEY &&
-      process.env.R2_BUCKET
+    process.env.CLOUDINARY_CLOUD_NAME &&
+      process.env.CLOUDINARY_API_KEY &&
+      process.env.CLOUDINARY_API_SECRET
   );
 }
 
 function getDriver() {
-  if (hasR2Config()) return "cloudflare-r2";
+  if (hasCloudinaryConfig()) return "cloudinary";
   if (process.env.BLOB_READ_WRITE_TOKEN) return "vercel-blob";
   return "local";
 }
@@ -41,117 +42,86 @@ function ensureLocalDirs() {
 }
 
 // ==========================================================================
-// Driver 1: Cloudflare R2 (10 GB Free, Unlimited Egress, Never Pauses)
+// Driver 1: Cloudinary (25 GB Free, No Credit Card, Never Pauses, Auto WebP)
 // ==========================================================================
 
-let r2Client = null;
-let s3Mod = null;
+let cloudinaryInst = null;
 
-function getR2() {
-  if (!s3Mod) s3Mod = require("@aws-sdk/client-s3");
-  if (!r2Client) {
-    const { S3Client } = s3Mod;
-    r2Client = new S3Client({
-      region: "auto",
-      endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-      credentials: {
-        accessKeyId: process.env.R2_ACCESS_KEY_ID,
-        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-      },
+function getCloudinary() {
+  if (!cloudinaryInst) {
+    const { v2 } = require("cloudinary");
+    v2.config({
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+      api_key: process.env.CLOUDINARY_API_KEY,
+      api_secret: process.env.CLOUDINARY_API_SECRET,
+      secure: true,
     });
+    cloudinaryInst = v2;
   }
-  return { client: r2Client, ...s3Mod };
+  return cloudinaryInst;
 }
 
-function r2PublicBase() {
-  return String(process.env.R2_PUBLIC_URL || "").replace(/\/+$/, "");
+function uploadBufferToCloudinary(buffer, options) {
+  const cld = getCloudinary();
+  return new Promise((resolve, reject) => {
+    const stream = cld.uploader.upload_stream(options, (err, result) => {
+      if (err) return reject(err);
+      resolve(result);
+    });
+    stream.end(buffer);
+  });
 }
 
-async function r2ReadJSON() {
-  const { client, GetObjectCommand } = getR2();
+async function cloudinaryReadJSON() {
+  const cld = getCloudinary();
   try {
-    const res = await client.send(
-      new GetObjectCommand({
-        Bucket: process.env.R2_BUCKET,
-        Key: STATE_KEY,
-      })
-    );
-    const text = await res.Body.transformToString("utf8");
-    return JSON.parse(text);
+    // Admin API returns the exact latest versioned secure_url (never stale CDN cache)
+    const info = await cld.api.resource(CLOUDINARY_STATE_PUBLIC_ID, { resource_type: "raw" });
+    if (!info || !info.secure_url) return null;
+    const res = await fetch(`${info.secure_url}?t=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) return null;
+    return res.json();
   } catch (err) {
-    if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
-      return null;
-    }
-    throw new Error(`Cloudflare R2 read error: ${err.message}`);
+    const status = err?.http_code || err?.error?.http_code;
+    if (status === 404) return null;
+    throw new Error(`Cloudinary read error: ${err?.message || err?.error?.message || "Unknown error"}`);
   }
 }
 
-async function r2WriteJSON(data) {
-  const { client, PutObjectCommand } = getR2();
-  await client.send(
-    new PutObjectCommand({
-      Bucket: process.env.R2_BUCKET,
-      Key: STATE_KEY,
-      Body: JSON.stringify(data),
-      ContentType: "application/json; charset=utf-8",
-      CacheControl: "no-store",
-    })
-  );
+async function cloudinaryWriteJSON(data) {
+  const buf = Buffer.from(JSON.stringify(data), "utf8");
+  await uploadBufferToCloudinary(buf, {
+    public_id: CLOUDINARY_STATE_PUBLIC_ID,
+    resource_type: "raw",
+    overwrite: true,
+    invalidate: true,
+  });
 }
 
-async function r2UploadImage(buffer, originalname, mimetype) {
-  const { client, PutObjectCommand } = getR2();
-  const filename = makeFilename(originalname);
-  const key = `uploads/${filename}`;
-  await client.send(
-    new PutObjectCommand({
-      Bucket: process.env.R2_BUCKET,
-      Key: key,
-      Body: buffer,
-      ContentType: mimetype || "image/jpeg",
-      CacheControl: "public, max-age=31536000, immutable",
-    })
-  );
-  const pubBase = r2PublicBase();
-  return pubBase ? `${pubBase}/${key}` : `/uploads/${filename}`;
+async function cloudinaryUploadImage(buffer) {
+  const result = await uploadBufferToCloudinary(buffer, {
+    folder: `${CLOUDINARY_FOLDER}/uploads`,
+    resource_type: "image",
+    transformation: [{ quality: "auto:good", fetch_format: "auto" }],
+  });
+  return result.secure_url;
 }
 
-async function r2ReadImage(filename) {
-  const { client, GetObjectCommand } = getR2();
-  const key = `uploads/${path.basename(filename)}`;
-  const res = await client.send(
-    new GetObjectCommand({
-      Bucket: process.env.R2_BUCKET,
-      Key: key,
-    })
-  );
-  const bytes = await res.Body.transformToByteArray();
-  return {
-    buffer: Buffer.from(bytes),
-    contentType: res.ContentType || "image/jpeg",
-  };
-}
-
-async function r2DeleteImage(url) {
-  if (!url) return;
-  let key = "";
-  const pubBase = r2PublicBase();
-  if (pubBase && url.startsWith(`${pubBase}/`)) {
-    key = url.slice(pubBase.length + 1);
-  } else if (url.startsWith("/uploads/")) {
-    key = `uploads/${path.basename(url)}`;
-  }
-  if (!key) return;
+async function cloudinaryDeleteImage(url) {
+  if (!url || !url.includes("res.cloudinary.com")) return;
   try {
-    const { client, DeleteObjectCommand } = getR2();
-    await client.send(
-      new DeleteObjectCommand({
-        Bucket: process.env.R2_BUCKET,
-        Key: key,
-      })
-    );
+    const marker = "/upload/";
+    const idx = url.indexOf(marker);
+    if (idx === -1) return;
+    let tail = url.slice(idx + marker.length);
+    // Strip optional transformation/version segments (e.g. v1795175000/)
+    tail = tail.replace(/^(?:[a-z]_[^/]+\/)*v\d+\//, "");
+    const publicId = tail.replace(/\.[^/.]+$/, "");
+    if (!publicId) return;
+    const cld = getCloudinary();
+    await cld.uploader.destroy(publicId, { resource_type: "image" });
   } catch (err) {
-    console.warn("Cloudflare R2 delete warning:", err.message);
+    console.warn("Cloudinary delete warning:", err.message);
   }
 }
 
@@ -167,8 +137,8 @@ function getVercelBlob() {
 
 async function blobReadJSON() {
   const { list } = getVercelBlob();
-  const { blobs } = await list({ prefix: STATE_KEY, limit: 1 });
-  const match = blobs.find((b) => b.pathname === STATE_KEY) || blobs[0];
+  const { blobs } = await list({ prefix: BLOB_STATE_KEY, limit: 1 });
+  const match = blobs.find((b) => b.pathname === BLOB_STATE_KEY) || blobs[0];
   if (!match) return null;
   const res = await fetch(`${match.url}?t=${Date.now()}`, { cache: "no-store" });
   if (!res.ok) return null;
@@ -177,7 +147,7 @@ async function blobReadJSON() {
 
 async function blobWriteJSON(data) {
   const { put } = getVercelBlob();
-  await put(STATE_KEY, JSON.stringify(data), {
+  await put(BLOB_STATE_KEY, JSON.stringify(data), {
     access: "public",
     addRandomSuffix: false,
     allowOverwrite: true,
@@ -254,21 +224,21 @@ async function localDeleteImage(url) {
 
 async function readState() {
   const driver = getDriver();
-  if (driver === "cloudflare-r2") return r2ReadJSON();
+  if (driver === "cloudinary") return cloudinaryReadJSON();
   if (driver === "vercel-blob") return blobReadJSON();
   return localReadJSON();
 }
 
 async function writeState(data) {
   const driver = getDriver();
-  if (driver === "cloudflare-r2") return r2WriteJSON(data);
+  if (driver === "cloudinary") return cloudinaryWriteJSON(data);
   if (driver === "vercel-blob") return blobWriteJSON(data);
   return localWriteJSON(data);
 }
 
 async function saveImage(buffer, originalname, mimetype) {
   const driver = getDriver();
-  if (driver === "cloudflare-r2") return r2UploadImage(buffer, originalname, mimetype);
+  if (driver === "cloudinary") return cloudinaryUploadImage(buffer);
   if (driver === "vercel-blob") return blobUploadImage(buffer, originalname, mimetype);
   return localUploadImage(buffer, originalname);
 }
@@ -276,7 +246,7 @@ async function saveImage(buffer, originalname, mimetype) {
 async function deleteImage(url) {
   if (!url) return;
   const driver = getDriver();
-  if (driver === "cloudflare-r2") return r2DeleteImage(url);
+  if (driver === "cloudinary") return cloudinaryDeleteImage(url);
   if (driver === "vercel-blob") return blobDeleteImage(url);
   return localDeleteImage(url);
 }
@@ -289,5 +259,4 @@ module.exports = {
   writeState,
   saveImage,
   deleteImage,
-  r2ReadImage,
 };
